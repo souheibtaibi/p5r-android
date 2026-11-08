@@ -399,6 +399,14 @@ bool make_swapchain() {
     ci.surface = g_surface;
     ci.minImageCount = std::max(caps.minImageCount, 3u);
     if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
+    // NX_SC_IMAGES=n: ask for n swapchain images (diagnostic: an acquire that never returns can mean the compositor
+    // holds every image).
+    if (const char* e = std::getenv("NX_SC_IMAGES"); e && std::atol(e) > 0) {
+        ci.minImageCount = std::max(uint32_t(std::atol(e)), caps.minImageCount);
+        if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
+    }
+    log("nvn/vk: [diag build] swapchain images: surface allows %u to %u, asking for %u", caps.minImageCount, caps.maxImageCount,
+        ci.minImageCount);
     ci.imageFormat = g_sc_format;
     ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     ci.imageExtent = extent;
@@ -743,14 +751,27 @@ void present_headless(uint64_t texture) {
 uint64_t picture_latency_ns() { return g_picture_latency.load(std::memory_order_relaxed); }
 
 void gpu_present(uint64_t texture, const int32_t* crop, uint64_t origin_ns) {
+    // Present trace: the first 12 presents (all of them with NX_PRESENT_TRACE=1) log every step that can block, so a
+    // present that never returns shows where it stopped: the last "present #" line before the silence.
+    static std::atomic<uint64_t> present_seq{0};
+    static const bool trace_all = std::getenv("NX_PRESENT_TRACE") != nullptr;
+    const unsigned long long pn = present_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool trace = trace_all || pn <= 12;
+    const uint64_t t_enter = plat::monotonic_ns();
+    if (trace) log("nvn/vk: present #%llu: enter", pn);
     plat::perf_hint_thread();  // the thread that presents takes part in the frame (perf_hint.cpp)
     std::lock_guard lk(g_gpu);
+    if (trace) log("nvn/vk: present #%llu: GPU lock taken after %.1f ms", pn, double(plat::monotonic_ns() - t_enter) / 1e6);
     PresentTimer timer;
     drain_objects();  // under the GPU lock, as in gpu_submit
     if (!init()) return;
+    if (trace) log("nvn/vk: present #%llu: retiring images (async %d, pipelined %d)", pn, int(async_gpu()), int(pipelined()));
     if (!async_gpu() || pipelined()) free_retired_images(async_gpu() ? frame_completed() : UINT64_MAX);
     if (plat::headless()) return present_headless(texture);
-    if (plat::window_minimized()) return;
+    if (plat::window_minimized()) {
+        if (trace) log("nvn/vk: present #%llu: window minimized, nothing presented", pn);
+        return;
+    }
     if (plat::window_generation() != g_window_gen) {  // Android: a new window after home or the lock screen
         if (async_gpu()) frame_wait_all();
         p_vkDeviceWaitIdle(g_device);
@@ -763,7 +784,27 @@ void gpu_present(uint64_t texture, const int32_t* crop, uint64_t origin_ns) {
     if (!g_swapchain && !make_swapchain()) return;
     uint32_t index = 0;
     VkSemaphore acquired = async_gpu() ? frame_acquire_semaphore() : g_acquired;
-    VkResult r = p_vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &index);
+    // NX_ACQUIRE_TIMEOUT_MS (default 3000, 0 = wait forever): an acquire that does not return would freeze the game
+    // for good. On a timeout the frame is skipped and now and then the swapchain is made again.
+    static const uint64_t acquire_ns = [] {
+        const char* e = std::getenv("NX_ACQUIRE_TIMEOUT_MS");
+        const long ms = e ? std::atol(e) : 3000;
+        return ms > 0 ? uint64_t(ms) * 1'000'000ull : UINT64_MAX;
+    }();
+    const uint64_t t_acquire = plat::monotonic_ns();
+    if (trace) log("nvn/vk: present #%llu: acquiring an image", pn);
+    VkResult r = p_vkAcquireNextImageKHR(g_device, g_swapchain, acquire_ns, acquired, VK_NULL_HANDLE, &index);
+    if (trace || r == VK_TIMEOUT || r == VK_NOT_READY)
+        log("nvn/vk: present #%llu: acquire -> %d, image %u, %.1f ms", pn, int(r), index,
+            double(plat::monotonic_ns() - t_acquire) / 1e6);
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) {
+        static unsigned timeouts = 0;
+        if (++timeouts == 1 || timeouts % 20 == 0) {
+            log("nvn/vk: no swapchain image came back (%u times): swapchain made again", timeouts);
+            make_swapchain();
+        }
+        return;
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         make_swapchain();
         return;
@@ -816,6 +857,7 @@ void gpu_present(uint64_t texture, const int32_t* crop, uint64_t origin_ns) {
     if (dump) transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);  // the present pass left it sampled
     dump = dump && frame_dump_record(g_cb, *src);
     VkSemaphore rendered = async_gpu() ? frame_rendered_semaphore(index) : g_rendered;
+    if (trace) log("nvn/vk: present #%llu: submitting the frame (%s)", pn, async_gpu() ? "async" : "wait for the fence");
     if (async_gpu())  // the blit's fence is not waited for (vkQueuePresentKHR waits on `rendered`); a dumped frame is
         frame_submit(acquired, rendered, {}, dump);
     else
@@ -837,7 +879,10 @@ void gpu_present(uint64_t texture, const int32_t* crop, uint64_t origin_ns) {
         times.swapchainCount = 1, times.pTimes = &when;
         pi.pNext = &times;
     }
+    if (trace) log("nvn/vk: present #%llu: queue present (image %u)", pn, index);
+    const uint64_t t_queue = plat::monotonic_ns();
     r = p_vkQueuePresentKHR(g_queue, &pi);
+    if (trace) log("nvn/vk: present #%llu: presented -> %d in %.1f ms", pn, int(r), double(plat::monotonic_ns() - t_queue) / 1e6);
     if (g_past_timing && origin_ns && r >= 0) {  // the pictures that reached the screen since the last present
         VkPastPresentationTimingGOOGLE past[16];
         uint32_t n = 16;
