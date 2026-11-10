@@ -72,7 +72,7 @@ struct Latch {
     uint64_t button, until_ns;
 };
 std::vector<Latch> g_latched;
-constexpr uint64_t kMinHoldNs = 150'000'000;
+constexpr uint64_t kMinHoldNs = 25'000'000;  // 25 ms (~1.5 frames at 60 fps) so rapid taps never coalesce into a hold
 
 void release_touch(const Touch& t, uint64_t now) {
     if (t.button && now < t.down_ns + kMinHoldNs) g_latched.push_back({t.button, t.down_ns + kMinHoldNs});
@@ -115,30 +115,49 @@ float camera_sens() {
 uint64_t key_to_button(int32_t k) {
     if (gamepad_swap_abxy()) {
         switch (k) {
-            case AKEYCODE_BUTTON_A: return kA;
-            case AKEYCODE_BUTTON_B: return kB;
-            case AKEYCODE_BUTTON_X: return kX;
-            case AKEYCODE_BUTTON_Y: return kY;
+            case AKEYCODE_BUTTON_A:
+            case AKEYCODE_BUTTON_3: return kA;  // bottom face button (Cross / A)
+            case AKEYCODE_BUTTON_B:
+            case AKEYCODE_BUTTON_2: return kB;  // right face button (Circle / B)
+            case AKEYCODE_BUTTON_X:
+            case AKEYCODE_BUTTON_4: return kX;  // left face button (Square / X)
+            case AKEYCODE_BUTTON_Y:
+            case AKEYCODE_BUTTON_1: return kY;  // top face button (Triangle / Y)
             default: break;
         }
     } else {
         switch (k) {
-            case AKEYCODE_BUTTON_A: return kB;  // bottom face button = Nintendo B
-            case AKEYCODE_BUTTON_B: return kA;  // right face button = Nintendo A
-            case AKEYCODE_BUTTON_X: return kY;
-            case AKEYCODE_BUTTON_Y: return kX;
+            case AKEYCODE_BUTTON_A:
+            case AKEYCODE_BUTTON_3: return kB;  // bottom face button = Nintendo B
+            case AKEYCODE_BUTTON_B:
+            case AKEYCODE_BUTTON_2: return kA;  // right face button = Nintendo A
+            case AKEYCODE_BUTTON_X:
+            case AKEYCODE_BUTTON_4: return kY;  // left face button = Nintendo Y
+            case AKEYCODE_BUTTON_Y:
+            case AKEYCODE_BUTTON_1: return kX;  // top face button = Nintendo X
             default: break;
         }
     }
     switch (k) {
-        case AKEYCODE_BUTTON_L1: return kL;
-        case AKEYCODE_BUTTON_R1: return kR;
-        case AKEYCODE_BUTTON_L2: return kZL;
-        case AKEYCODE_BUTTON_R2: return kZR;
-        case AKEYCODE_BUTTON_START: return kPlus;
-        case AKEYCODE_BUTTON_SELECT: return kMinus;
-        case AKEYCODE_BUTTON_THUMBL: return kStickL;
-        case AKEYCODE_BUTTON_THUMBR: return kStickR;
+        case AKEYCODE_BUTTON_L1:
+        case AKEYCODE_BUTTON_7: return kL;
+        case AKEYCODE_BUTTON_R1:
+        case AKEYCODE_BUTTON_8: return kR;
+        case AKEYCODE_BUTTON_L2:
+        case AKEYCODE_BUTTON_5:
+        case AKEYCODE_BUTTON_C: return kZL;
+        case AKEYCODE_BUTTON_R2:
+        case AKEYCODE_BUTTON_6:
+        case AKEYCODE_BUTTON_Z: return kZR;
+        case AKEYCODE_BUTTON_START:
+        case AKEYCODE_BUTTON_10:
+        case AKEYCODE_BUTTON_MODE: return kPlus;
+        case AKEYCODE_BUTTON_SELECT:
+        case AKEYCODE_BUTTON_9: return kMinus;
+        case AKEYCODE_BUTTON_THUMBL:
+        case AKEYCODE_BUTTON_11: return kStickL;
+        case AKEYCODE_BUTTON_THUMBR:
+        case AKEYCODE_BUTTON_12: return kStickR;
         case AKEYCODE_DPAD_LEFT: return kLeft;
         case AKEYCODE_DPAD_UP: return kUp;
         case AKEYCODE_DPAD_RIGHT: return kRight;
@@ -221,7 +240,11 @@ int32_t on_input(android_app*, AInputEvent* e) {
         g_h = float(ANativeWindow_getHeight(w));
     }
     if (kind == AMOTION_EVENT_ACTION_DOWN || kind == AMOTION_EVENT_ACTION_POINTER_DOWN) {
+        if (kind == AMOTION_EVENT_ACTION_DOWN) g_touches.clear();  // primary touch start guarantees no prior fingers remain
         float x = AMotionEvent_getX(e, index), y = AMotionEvent_getY(e, index);
+        int32_t id = AMotionEvent_getPointerId(e, index);
+        g_touches.erase(std::remove_if(g_touches.begin(), g_touches.end(), [&](const Touch& t) { return t.id == id; }),
+                        g_touches.end());
         g_gamepad = false;
         size_t drawn = 0;
         touch_buttons(drawn);
@@ -229,10 +252,10 @@ int32_t on_input(android_app*, AInputEvent* e) {
             uint64_t b = touch_hit(x / g_w, y / g_h, g_w / g_h);
             bool left = !b && touch_stick_side(x / g_w);
             Stick stick = b ? kNoStick : left ? kLeftStick : touch_right_stick() ? kRightStick : kNoStick;
-            if (b || stick) g_touches.push_back({AMotionEvent_getPointerId(e, index), x, y, x, y, stick, b, now});
+            if (b || stick) g_touches.push_back({id, x, y, x, y, stick, b, now});
         } else {
             bool left = x < g_w * 0.5f;
-            g_touches.push_back({AMotionEvent_getPointerId(e, index), x, y, x, y, left ? kLeftStick : kNoStick,
+            g_touches.push_back({id, x, y, x, y, left ? kLeftStick : kNoStick,
                                  left ? 0 : touch_button(x, y), now});
         }
     } else if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_POINTER_UP ||
@@ -247,12 +270,26 @@ int32_t on_input(android_app*, AInputEvent* e) {
                                        }),
                         g_touches.end());
     } else if (kind == AMOTION_EVENT_ACTION_MOVE) {
-        for (size_t k = 0; k < AMotionEvent_getPointerCount(e); k++) {
+        size_t drawn = 0;
+        touch_buttons(drawn);
+        size_t count = AMotionEvent_getPointerCount(e);
+        // Prune any touch whose pointer id is no longer reported by Android (prevents stuck ZR/buttons).
+        g_touches.erase(std::remove_if(g_touches.begin(), g_touches.end(),
+                                       [&](const Touch& t) {
+                                           for (size_t k = 0; k < count; k++)
+                                               if (AMotionEvent_getPointerId(e, k) == t.id) return false;
+                                           return true;
+                                       }),
+                        g_touches.end());
+        for (size_t k = 0; k < count; k++) {
             int32_t id = AMotionEvent_getPointerId(e, k);
             for (auto& t : g_touches)
                 if (t.id == id) {
                     t.x = AMotionEvent_getX(e, k);
                     t.y = AMotionEvent_getY(e, k);
+                    if (t.stick == kNoStick) {
+                        t.button = drawn ? touch_hit(t.x / g_w, t.y / g_h, g_w / g_h) : touch_button(t.x, t.y);
+                    }
                 }
         }
     }
